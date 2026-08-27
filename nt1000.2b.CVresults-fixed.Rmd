@@ -1,0 +1,333 @@
+---
+title: "nt1000.2b.CV results"
+output: html_document
+---
+
+```{r,echo=FALSE,message=FALSE,error=FALSE,warning=FALSE}
+rm(list=ls())
+
+library(pROC)
+library(HandTill2001)
+source(file.path("R","multi_brier.R"))
+source(file.path("R","multi_logloss.R"))
+
+load(file.path("results","nt1000.2b.CVresults.RData"))
+
+options(max.print = 1000000)
+
+# ------------------------------------------------------------
+# Class names
+# IMPORTANT: define this BEFORE factor(..., levels=classes)
+# ------------------------------------------------------------
+if (is.null(colnames(scores))) {
+  stop("scores has no column names; class names cannot be determined.")
+}
+classes <- colnames(scores)
+
+if (!is.null(colnames(probs)) && !identical(colnames(probs), classes)) {
+  stop("Column names/order of scores and probs are different.")
+}
+
+cat("Number of classes:", length(classes), "\n")
+cat("scores:", paste(dim(scores), collapse=" x "), "\n")
+cat("probs :", paste(dim(probs), collapse=" x "), "\n\n")
+
+# ------------------------------------------------------------
+# Overall multiclass performance only
+# (NO per-class / 65 individual AUCs)
+# ------------------------------------------------------------
+AUCscores <- HandTill2001::auc(
+  multcap(response=as.factor(y), predicted=scores)
+)
+AUCprobs <- HandTill2001::auc(
+  multcap(response=as.factor(y), predicted=probs)
+)
+
+errs <- sum(y != ys) / length(y)
+errp <- sum(y != yp) / length(y)
+
+briers <- brier(scores, y)
+brierp <- brier(probs, y)
+
+logls <- mlogloss(scores, y)
+loglp <- mlogloss(probs, y)
+
+out <- cbind(
+  c(AUCscores, AUCprobs),
+  c(errs, errp),
+  c(briers, brierp),
+  c(logls, loglp)
+)
+colnames(out) <- c("auc", "misclassification", "brier score", "logloss")
+rownames(out) <- c("raw scores", "calibrated scores")
+print(out)
+
+# ------------------------------------------------------------
+# 65 x 65 confusion matrices
+# Keep all class levels even when a class is never predicted.
+# ------------------------------------------------------------
+y.true       <- factor(as.character(y),  levels=classes)
+y.score      <- factor(as.character(ys), levels=classes)
+y.calibrated <- factor(as.character(yp), levels=classes)
+
+cm_score <- table(y.true, y.score)
+cm_calibrated <- table(y.true, y.calibrated)
+
+cat("\nRaw-score confusion matrix dimension:",
+    paste(dim(cm_score), collapse=" x "), "\n")
+print(cm_score)
+
+cat("\nCalibrated-score confusion matrix dimension:",
+    paste(dim(cm_calibrated), collapse=" x "), "\n")
+print(cm_calibrated)
+
+write.csv(as.matrix(cm_score),
+          file.path("results", "nt1000.2b.confusion_raw.csv"),
+          row.names=TRUE)
+write.csv(as.matrix(cm_calibrated),
+          file.path("results", "nt1000.2b.confusion_calibrated.csv"),
+          row.names=TRUE)
+```
+
+## Calibrated-score confusion matrix
+
+```{r,echo=FALSE,message=FALSE,error=FALSE,warning=FALSE,fig.height=9,fig.width=9}
+# ------------------------------------------------------------
+# Fig.2-like 65 x 65 confusion matrix
+# - rows: annotated / true class
+# - columns: predicted class
+# - each row normalized to 100%
+# - class colour strips from Supplementary Excel
+# - black boxes for methylation class families (MCF)
+# ------------------------------------------------------------
+
+if (!requireNamespace("readxl", quietly=TRUE)) {
+  stop('Package "readxl" is required. Run install.packages("readxl") once.')
+}
+
+xlsx_name <- "41467_2020_20603_MOESM5_ESM.xlsx"
+xlsx_candidates <- c(
+  xlsx_name,
+  file.path("results", xlsx_name),
+  file.path("data", xlsx_name)
+)
+xlsx_path <- xlsx_candidates[file.exists(xlsx_candidates)][1]
+
+if (is.na(xlsx_path)) {
+  stop(paste0(
+    "Cannot find ", xlsx_name,
+    ". Put it in the project root, results/, or data/."
+  ))
+}
+
+meta0 <- readxl::read_excel(xlsx_path, skip=1)
+
+# The supplementary Excel has 65 rows.
+meta <- data.frame(
+  full   = trimws(as.character(meta0[[1]])),
+  abbr   = trimws(as.character(meta0[[2]])),
+  family = trimws(as.character(meta0[[4]])),
+  colour = trimws(as.character(meta0[[14]])),
+  stringsAsFactors=FALSE
+)
+meta <- meta[!is.na(meta$full) & meta$full != "", ]
+
+# Match model class names to the supplementary Excel.
+# First try exact matching. This avoids locale/encoding problems.
+idx <- match(classes, meta$full)
+
+# Fallback only for names that differ by punctuation/spacing.
+# Keep this ASCII-only so it works even on R sessions with a non-UTF-8 locale.
+ascii_key <- function(x) {
+  x0 <- as.character(x)
+  x1 <- suppressWarnings(iconv(x0, from="", to="ASCII//TRANSLIT", sub=""))
+  x1[is.na(x1)] <- ""
+  x1 <- tolower(x1)
+  gsub("[^a-z0-9]+", "", x1)
+}
+
+if (anyNA(idx)) {
+  miss <- which(is.na(idx))
+  idx[miss] <- match(ascii_key(classes[miss]), ascii_key(meta$full))
+}
+
+if (anyNA(idx)) {
+  warning(
+    paste0(
+      "The following model classes were not found in the colour-code Excel: ",
+      paste(classes[is.na(idx)], collapse=" | "),
+      ". Grey will be used for those classes."
+    )
+  )
+}
+
+abbr <- meta$abbr[idx]
+colour <- meta$colour[idx]
+family <- meta$family[idx]
+
+# Fallbacks for unmatched / blank cells.
+abbr[is.na(abbr) | abbr == ""] <- classes[is.na(abbr) | abbr == ""]
+colour[is.na(colour) | colour == "" | colour == "NA"] <- "#BDBDBD"
+family[is.na(family) | family == ""] <- "not applicable"
+
+# The supplied Excel has a blank Figure Colour Code for RMS (MYOD1),
+# therefore grey is used only for that blank/missing entry.
+
+# Make the two MCF blocks contiguous, as in Fig. 2.
+super_family <- rep(NA_character_, length(classes))
+super_family[family %in% c("MCF CSA", "MCF CSA (IDH)")] <- "MCF CSA / CSA (IDH)"
+super_family[family == "MCF SARC (BCOR)"] <- "MCF SARC (BCOR)"
+
+# Preserve the original model class order, except that members of each
+# MCF are gathered together at the position of the first member.
+make_grouped_order <- function(n, group) {
+  out <- integer(0)
+  used <- rep(FALSE, n)
+  groups <- unique(group[!is.na(group)])
+
+  for (i in seq_len(n)) {
+    if (used[i]) next
+
+    if (!is.na(group[i])) {
+      gidx <- which(group == group[i])
+      out <- c(out, gidx)
+      used[gidx] <- TRUE
+    } else {
+      out <- c(out, i)
+      used[i] <- TRUE
+    }
+  }
+  out
+}
+
+ord <- make_grouped_order(length(classes), super_family)
+plot_classes <- classes[ord]
+plot_abbr <- abbr[ord]
+plot_colour <- colour[ord]
+plot_family <- super_family[ord]
+
+# Reverse only the Predicted axis (x-axis), as requested.
+x_classes <- rev(plot_classes)
+x_abbr <- rev(plot_abbr)
+x_colour <- rev(plot_colour)
+
+# Reorder matrix and convert each annotated class (row) to percentage.
+cm_plot <- as.matrix(cm_calibrated)[plot_classes, x_classes, drop=FALSE]
+row_total <- rowSums(cm_plot)
+cm_pct <- sweep(cm_plot, 1, ifelse(row_total == 0, 1, row_total), "/") * 100
+
+# Save the percentage matrix and class key.
+write.csv(round(cm_pct, 3),
+          file.path("results", "nt1000.2b.confusion_calibrated_percent.csv"),
+          row.names=TRUE)
+
+class_key_out <- data.frame(
+  annotated_order=seq_along(plot_classes),
+  annotated_class=plot_classes,
+  annotated_abbreviation=plot_abbr,
+  annotated_colour=plot_colour,
+  predicted_order=seq_along(x_classes),
+  predicted_class=x_classes,
+  predicted_abbreviation=x_abbr,
+  predicted_colour=x_colour,
+  MCF=ifelse(is.na(plot_family), "", plot_family),
+  stringsAsFactors=FALSE
+)
+write.csv(class_key_out,
+          file.path("results", "nt1000.2b.confusion_class_key.csv"),
+          row.names=FALSE)
+
+# Colour scale similar to Fig. 2.
+heat_cols <- grDevices::colorRampPalette(
+  c("#FFFFFF", "#DEEBF7", "#9ECAE1", "#4292C6", "#08519C")
+)(101)
+
+# Main plotting function.
+draw_cm_fig2 <- function(show_abbreviations=FALSE) {
+  n <- nrow(cm_pct)
+
+  # Wider right margin / x-range to give the legend its own space.
+  par(mar=c(5.2, 5.2, 1.6, 11.5), xaxs="i", yaxs="i")
+  plot.new()
+  plot.window(xlim=c(0.5, n+14.0), ylim=c(0.5, n+0.5), asp=1)
+
+  # heatmap cells: first true class is placed at the top
+  for (i in seq_len(n)) {
+    yy <- n - i + 1
+    for (j in seq_len(n)) {
+      v <- cm_pct[i, j]
+      ci <- max(1, min(101, round(v) + 1))
+      rect(j-0.5, yy-0.5, j+0.5, yy+0.5,
+           col=heat_cols[ci], border=NA)
+    }
+  }
+
+  # very light cell grid
+  abline(v=seq(0.5, n+0.5, by=1), h=seq(0.5, n+0.5, by=1),
+         col="#F1F1F1", lwd=0.18)
+
+  # Explicit outer border around the heatmap body.
+  rect(0.5, 0.5, n+0.5, n+0.5, border="#555555", lwd=0.8)
+
+  # MCF black squares removed at user request.
+
+  # Colour strips for every class, matching Supplementary Data colour code.
+  par(xpd=NA)
+  for (j in seq_len(n)) {
+    rect(j-0.5, -0.35, j+0.5, 0.15,
+         col=x_colour[j], border=NA)
+  }
+  for (i in seq_len(n)) {
+    yy <- n - i + 1
+    rect(-0.35, yy-0.5, 0.15, yy+0.5,
+         col=plot_colour[i], border=NA)
+  }
+
+  # Optional abbreviations. Fig.2 itself essentially relies on colour strips,
+  # so FALSE gives the closest appearance and avoids unreadable 65 labels.
+  if (show_abbreviations) {
+    cex_lab <- 0.30
+    text(seq_len(n), -0.85, labels=x_abbr,
+         srt=90, adj=1, cex=cex_lab)
+    text(-0.85, n-seq_len(n)+1, labels=plot_abbr,
+         adj=1, cex=cex_lab)
+  }
+
+  text((n + 1) / 2, -1.10, labels="Predicted", cex=0.85)
+  text(-1.10, (n + 1) / 2, labels="Annotated", srt=90, cex=0.85)
+
+  # vertical 0--100% colour key on the right
+  key_x1 <- n + 7.0
+  key_x2 <- n + 8.6
+  key_y1 <- 9
+  key_y2 <- 33
+  dy <- (key_y2-key_y1)/101
+  for (k in 0:100) {
+    rect(key_x1, key_y1+k*dy, key_x2, key_y1+(k+1)*dy,
+         col=heat_cols[k+1], border=NA)
+  }
+  rect(key_x1, key_y1, key_x2, key_y2, border="grey40", lwd=0.5)
+  for (v in c(0,25,50,75,100)) {
+    yy <- key_y1 + (key_y2-key_y1)*v/100
+    segments(key_x2, yy, key_x2+0.28, yy, col="grey30")
+    text(key_x2+0.55, yy, labels=v, adj=0, cex=0.58)
+  }
+  text((key_x1+key_x2)/2, key_y2+2.2,
+       labels="Samples in annotated\nclasses (%)",
+       cex=0.58, adj=c(0.5,0))
+}
+
+# Draw in the HTML.
+draw_cm_fig2(show_abbreviations=FALSE)
+
+# Also save high-resolution standalone files.
+png(file.path("results", "nt1000.2b.confusion_calibrated_Fig2style.png"),
+    width=2700, height=2700, res=300, bg="white")
+draw_cm_fig2(show_abbreviations=FALSE)
+dev.off()
+
+pdf(file.path("results", "nt1000.2b.confusion_calibrated_Fig2style.pdf"),
+    width=9, height=9, useDingbats=FALSE)
+draw_cm_fig2(show_abbreviations=FALSE)
+dev.off()
+```
